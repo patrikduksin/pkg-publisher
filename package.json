@@ -1,0 +1,17 @@
+{
+  "name": "pkg-publisher",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "preinstall": "bun link --cwd ../alchemy/packages/alchemy && bun link --cwd ../alchemy/packages/pr-package",
+    "deploy": "alchemy deploy alchemy.run.ts --stage prod --profile personal --yes",
+    "destroy": "alchemy destroy alchemy.run.ts --stage prod --profile personal --yes",
+    "token": "bun scripts/token.ts",
+    "smoke": "bun scripts/smoke.ts"
+  },
+  "dependencies": {
+    "@alchemy.run/pr-package": "link:@alchemy.run/pr-package",
+    "alchemy": "link:alchemy",
+    "effect": "4.0.0-beta.102"
+  }
+}
