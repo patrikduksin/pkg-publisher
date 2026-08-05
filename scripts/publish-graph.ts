@@ -47,6 +47,7 @@ function checkoutStatus(checkout: string): string {
 
 function graphUrl(name: string, sha: string, parent?: string): string {
   const url = `https://${PUBLISHER_HOST}/${name}/${sha}`;
+  // Remove once a released Bun includes oven-sh/bun#35426 (duplicate tarball callback race, #35420).
   // Bun 1.3.14 repro: add the published AWS + Core URLs together, then Alchemy.
   // error: @distilled.cloud/core@https://pkg-pkgworker-prod-3h2ug3xkdl7e2fr4.patrikduksin.workers.dev/@distilled.cloud/core/7125b54be7eb9ab0f54a0480839c0e5c8c0a7d3d failed to resolve
   // error: @distilled.cloud/cloudflare-rolldown-plugin@https://pkg-pkgworker-prod-3h2ug3xkdl7e2fr4.patrikduksin.workers.dev/@distilled.cloud/cloudflare-rolldown-plugin/7125b54be7eb9ab0f54a0480839c0e5c8c0a7d3d failed to resolve
