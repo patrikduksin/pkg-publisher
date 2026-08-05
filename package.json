@@ -6,6 +6,7 @@
     "preinstall": "bun link --cwd ../alchemy/packages/alchemy && bun link --cwd ../alchemy/packages/pr-package",
     "deploy": "alchemy deploy alchemy.run.ts --stage prod --profile personal --yes",
     "destroy": "alchemy destroy alchemy.run.ts --stage prod --profile personal --yes",
+    "publish-graph": "bun scripts/publish-graph.ts",
     "token": "bun scripts/token.ts",
     "smoke": "bun scripts/smoke.ts"
   },
