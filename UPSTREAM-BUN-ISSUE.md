@@ -116,7 +116,7 @@ async function install(delayMs: number, attempt: number): Promise<Result> {
   );
   const child = Bun.spawn([bun, "install"], {
     cwd: project,
-    stdout: "pipe",
+    stdout: "ignore",
     stderr: "pipe",
     env: { ...process.env, BUN_INSTALL_CACHE_DIR: cache },
   });
