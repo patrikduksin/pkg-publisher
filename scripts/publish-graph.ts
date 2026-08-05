@@ -45,25 +45,27 @@ function checkoutStatus(checkout: string): string {
   );
 }
 
-function graphUrl(name: string, sha: string, parent?: string): string {
-  const url = `https://${PUBLISHER_HOST}/${name}/${sha}`;
+function graphTag(name: string, sha: string, parent?: string): string {
   // Bun's install pipeline drops a late duplicate tarball-URL dependency's callback when the shared extract task has already drained (direct + transitive occurrences of one URL racing).
   // error: @distilled.cloud/core@https://pkg-pkgworker-prod-3h2ug3xkdl7e2fr4.patrikduksin.workers.dev/@distilled.cloud/core/7125b54be7eb9ab0f54a0480839c0e5c8c0a7d3d failed to resolve
   // error: @distilled.cloud/cloudflare-rolldown-plugin@https://pkg-pkgworker-prod-3h2ug3xkdl7e2fr4.patrikduksin.workers.dev/@distilled.cloud/cloudflare-rolldown-plugin/7125b54be7eb9ab0f54a0480839c0e5c8c0a7d3d failed to resolve
   // Upstream fix: https://github.com/oven-sh/bun/pull/35426 (Tag::Tarball resolves from AppendedTaskPackageMap); maintainers ran our exact repro: it fails on 1.4.0-canary.1 and passes on the PR branch at 7cb3e38e2.
   // Our report: https://github.com/oven-sh/bun/pull/35426#issuecomment-5186518609. Full repro: UPSTREAM-BUN-ISSUE.md.
-  // TODO: Once a released Bun contains that fix, delete the ?from= mechanism entirely, republish the graph, and verify consumers get a single hoisted copy of @distilled.cloud/core.
+  // Each affected edge gets another tag for the same uploaded tarball. A query-string identity is not safe: Bun includes the literal `?` in its package-store directory and later misparses that path during module resolution.
+  // TODO: Once a released Bun contains the upstream fix, delete the per-edge tags, republish the graph, and verify consumers get a single hoisted copy of @distilled.cloud/core.
   const needsIdentity =
     parent !== undefined &&
     ((name === "@distilled.cloud/core" && parent !== "alchemy") ||
       (name === "@distilled.cloud/cloudflare-rolldown-plugin" &&
         parent === "@distilled.cloud/cloudflare-vite-plugin"));
-  if (!needsIdentity) return url;
+  if (!needsIdentity) return sha;
 
-  // Bun includes this identity in its package-store directory name. Keep it
-  // below the 255-byte file-name limit when the publisher host is long.
   const identity = parent.replace(/^@distilled\.cloud\//, "");
-  return `${url}?from=${encodeURIComponent(identity)}`;
+  return `graph-${sha}-from-${identity}`;
+}
+
+function graphUrl(name: string, tag: string): string {
+  return `https://${PUBLISHER_HOST}/${name}/${encodeURIComponent(tag)}`;
 }
 
 async function readManifest(path: string): Promise<Manifest> {
@@ -133,6 +135,7 @@ async function rewriteManifest(
   path: string,
   sha: string,
   workspaces: Map<string, GraphPackage>,
+  tagsByPackage: Map<string, Set<string>>,
 ): Promise<Map<string, string>> {
   const manifest = JSON.parse(await readFile(path, "utf8")) as Manifest;
   const rewritten = new Map<string, string>();
@@ -142,7 +145,11 @@ async function rewriteManifest(
     for (const [name, value] of Object.entries(dependencies)) {
       if (!value.startsWith("workspace:")) continue;
       if (!workspaces.has(name)) fail(`${manifest.name}: ${section}.${name} is not a workspace`);
-      const url = graphUrl(name, sha, manifest.name);
+      const tag = graphTag(name, sha, manifest.name);
+      const tags = tagsByPackage.get(name);
+      if (!tags) fail(`${manifest.name}: ${section}.${name} is not in the published graph`);
+      tags.add(tag);
+      const url = graphUrl(name, tag);
       dependencies[name] = url;
       rewritten.set(name, url);
     }
@@ -174,7 +181,7 @@ function validateManifest(
   }
 }
 
-async function upload(pkg: PackedPackage, sha: string, token: string): Promise<void> {
+async function upload(pkg: PackedPackage, tags: string[], token: string): Promise<void> {
   const project = pkg.name.split("/").map(encodeURIComponent).join("/");
   const response = await fetch(`https://${PUBLISHER_HOST}/projects/${project}/packages`, {
     method: "PUT",
@@ -182,7 +189,7 @@ async function upload(pkg: PackedPackage, sha: string, token: string): Promise<v
       Authorization: `Bearer ${token}`,
       "Content-Type": "application/gzip",
       "Content-Length": String(pkg.size),
-      "X-Tags": JSON.stringify([sha]),
+      "X-Tags": JSON.stringify(tags),
       "X-TTL": TTL,
     },
     body: Bun.file(pkg.tarball),
@@ -210,6 +217,7 @@ const packages = await deriveGraph(checkout, workspaces);
 console.log("Derived runtime package graph:");
 for (const pkg of packages) console.log(`${pkg.name} (${pkg.path})`);
 if (packages.at(-1)?.name !== ROOT_PACKAGE.name) fail(`${ROOT_PACKAGE.name} must be last`);
+const tagsByPackage = new Map(packages.map((pkg) => [pkg.name, new Set([sha])]));
 
 const token = (await readFile(resolve(".auth-token"), "utf8")).trim();
 if (!token) fail(".auth-token is empty; run bun run token first");
@@ -241,7 +249,12 @@ for (const pkg of packages) {
     recursive: true,
     filter: (path) => basename(path) !== "node_modules" && !path.endsWith(".tgz"),
   });
-  const rewritten = await rewriteManifest(join(staged, "package.json"), sha, workspaces);
+  const rewritten = await rewriteManifest(
+    join(staged, "package.json"),
+    sha,
+    workspaces,
+    tagsByPackage,
+  );
 
   const readme = resolve(source, "../../README.md");
   if (await Bun.file(readme).exists()) await cp(readme, join(staged, "README.md"));
@@ -263,8 +276,11 @@ for (const pkg of packages) {
 const finalStatus = checkoutStatus(checkout);
 if (finalStatus) fail(`Packaging mutated the Alchemy checkout:\n${finalStatus}`);
 
-for (const pkg of packed.slice(0, -1)) await upload(pkg, sha, token);
-await upload(packed.at(-1)!, sha, token);
+for (const pkg of packed.slice(0, -1)) {
+  await upload(pkg, [...tagsByPackage.get(pkg.name)!], token);
+}
+const root = packed.at(-1)!;
+await upload(root, [...tagsByPackage.get(root.name)!], token);
 
 const completedStatus = checkoutStatus(checkout);
 if (completedStatus) fail(`Publishing mutated the Alchemy checkout:\n${completedStatus}`);

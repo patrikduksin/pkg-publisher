@@ -169,3 +169,11 @@ On both tested Bun versions, the zero-latency group exits with `failed to resolv
 - `test/cli/install/bun-install-git-deps.test.ts` adds `installs every tarball-URL dependency that appears directly and transitively`, a dedicated localhost HTTP-tarball regression test for this failure mode.
 
 The PR is still open, and its fix is not present in the canary revision tested above.
+
+## Production workaround
+
+The package graph cannot use one identical URL for every direct and transitive occurrence until the upstream fix ships in a Bun release. The publisher therefore uploads each tarball with its commit-SHA tag plus an additional `graph-<sha>-from-<parent>` tag for every affected duplicate edge. Both tags point to the same immutable package resource, but their distinct alias paths give Bun distinct install-task identities.
+
+Do not put the edge identity in a query string. Bun 1.3.14 preserves the literal `?` in its package-store directory name and later treats that path as a package specifier boundary during runtime module resolution. Installation may succeed, but an installed CLI can then fail to resolve its modules. Path-based tags avoid both the install race and that runtime failure.
+
+Once a released Bun contains oven-sh/bun#35426, remove the per-edge tags, republish the graph, and verify that installation and runtime resolution both pass with one commit-SHA URL per package.
