@@ -58,7 +58,12 @@ function graphUrl(name: string, sha: string, parent?: string): string {
     ((name === "@distilled.cloud/core" && parent !== "alchemy") ||
       (name === "@distilled.cloud/cloudflare-rolldown-plugin" &&
         parent === "@distilled.cloud/cloudflare-vite-plugin"));
-  return needsIdentity ? `${url}?from=${encodeURIComponent(parent)}` : url;
+  if (!needsIdentity) return url;
+
+  // Bun includes this identity in its package-store directory name. Keep it
+  // below the 255-byte file-name limit when the publisher host is long.
+  const identity = parent.replace(/^@distilled\.cloud\//, "");
+  return `${url}?from=${encodeURIComponent(identity)}`;
 }
 
 async function readManifest(path: string): Promise<Manifest> {
