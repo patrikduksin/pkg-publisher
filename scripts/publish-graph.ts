@@ -1,18 +1,18 @@
 import { cp, mkdir, mkdtemp, readFile, readdir, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { basename, dirname, join, resolve } from "node:path";
-import { PACKAGES, PUBLISHER_HOST, TTL, type GraphPackage } from "./graph.config.ts";
+import { basename, dirname, join, relative, resolve } from "node:path";
+import { PUBLISHER_HOST, ROOT_PACKAGE, TTL } from "./graph.config.ts";
 
-const DEPENDENCY_SECTIONS = [
-  "dependencies",
-  "devDependencies",
-  "peerDependencies",
-  "optionalDependencies",
-] as const;
+const DEPENDENCY_SECTIONS = ["dependencies", "optionalDependencies", "peerDependencies"] as const;
+
+type GraphPackage = { name: string; path: string };
 
 type Manifest = {
   name?: string;
-  [section: string]: string | Record<string, string> | undefined;
+  workspaces?: { packages?: string[] };
+  dependencies?: Record<string, string> | null;
+  optionalDependencies?: Record<string, string> | null;
+  peerDependencies?: Record<string, string> | null;
 };
 
 type PackedPackage = GraphPackage & {
@@ -47,10 +47,12 @@ function checkoutStatus(checkout: string): string {
 
 function graphUrl(name: string, sha: string, parent?: string): string {
   const url = `https://${PUBLISHER_HOST}/${name}/${sha}`;
-  // Remove once a released Bun includes oven-sh/bun#35426 (duplicate tarball callback race, #35420).
-  // Bun 1.3.14 repro: add the published AWS + Core URLs together, then Alchemy.
+  // Bun's install pipeline drops a late duplicate tarball-URL dependency's callback when the shared extract task has already drained (direct + transitive occurrences of one URL racing).
   // error: @distilled.cloud/core@https://pkg-pkgworker-prod-3h2ug3xkdl7e2fr4.patrikduksin.workers.dev/@distilled.cloud/core/7125b54be7eb9ab0f54a0480839c0e5c8c0a7d3d failed to resolve
   // error: @distilled.cloud/cloudflare-rolldown-plugin@https://pkg-pkgworker-prod-3h2ug3xkdl7e2fr4.patrikduksin.workers.dev/@distilled.cloud/cloudflare-rolldown-plugin/7125b54be7eb9ab0f54a0480839c0e5c8c0a7d3d failed to resolve
+  // Upstream fix: https://github.com/oven-sh/bun/pull/35426 (Tag::Tarball resolves from AppendedTaskPackageMap); maintainers ran our exact repro: it fails on 1.4.0-canary.1 and passes on the PR branch at 7cb3e38e2.
+  // Our report: https://github.com/oven-sh/bun/pull/35426#issuecomment-5186518609. Full repro: UPSTREAM-BUN-ISSUE.md.
+  // TODO: Once a released Bun contains that fix, delete the ?from= mechanism entirely, republish the graph, and verify consumers get a single hoisted copy of @distilled.cloud/core.
   const needsIdentity =
     parent !== undefined &&
     ((name === "@distilled.cloud/core" && parent !== "alchemy") ||
@@ -59,19 +61,85 @@ function graphUrl(name: string, sha: string, parent?: string): string {
   return needsIdentity ? `${url}?from=${encodeURIComponent(parent)}` : url;
 }
 
-async function rewriteManifest(path: string, sha: string): Promise<Map<string, string>> {
+async function readManifest(path: string): Promise<Manifest> {
+  return JSON.parse(await readFile(path, "utf8")) as Manifest;
+}
+
+async function workspaceIndex(checkout: string): Promise<Map<string, GraphPackage>> {
+  const packages = new Map<string, GraphPackage>();
+  for (const workspaceRoot of ["", "distilled", "cloudflare-tools"]) {
+    const root = join(checkout, workspaceRoot);
+    const manifest = await readManifest(join(root, "package.json"));
+    for (const pattern of manifest.workspaces?.packages ?? []) {
+      for await (const path of new Bun.Glob(`${pattern}/package.json`).scan({
+        cwd: root,
+        onlyFiles: true,
+      })) {
+        const packagePath = relative(checkout, dirname(join(root, path)));
+        const pkg = await readManifest(join(checkout, packagePath, "package.json"));
+        if (!pkg.name) continue;
+        const existing = packages.get(pkg.name);
+        if (existing && existing.path !== packagePath) {
+          fail(`${pkg.name}: workspace name resolves to both ${existing.path} and ${packagePath}`);
+        }
+        packages.set(pkg.name, { name: pkg.name, path: packagePath });
+      }
+    }
+  }
+  return packages;
+}
+
+async function deriveGraph(
+  checkout: string,
+  workspaces: Map<string, GraphPackage>,
+): Promise<GraphPackage[]> {
+  const root = workspaces.get(ROOT_PACKAGE.name);
+  if (!root || root.path !== ROOT_PACKAGE.path) {
+    fail(`${ROOT_PACKAGE.name}: expected workspace at ${ROOT_PACKAGE.path}`);
+  }
+
+  const ordered: GraphPackage[] = [];
+  const visited = new Set<string>();
+  const visiting = new Set<string>();
+  async function visit(pkg: GraphPackage): Promise<void> {
+    if (visited.has(pkg.name)) return;
+    if (visiting.has(pkg.name)) fail(`Workspace runtime dependency cycle includes ${pkg.name}`);
+    visiting.add(pkg.name);
+    const manifest = await readManifest(join(checkout, pkg.path, "package.json"));
+    for (const section of DEPENDENCY_SECTIONS) {
+      const dependencies = manifest[section];
+      if (!dependencies) continue;
+      for (const [name, value] of Object.entries(dependencies)) {
+        if (!value.startsWith("workspace:")) continue;
+        const dependency = workspaces.get(name);
+        if (!dependency) fail(`${pkg.name}: ${section}.${name} cannot be resolved to a workspace`);
+        await visit(dependency);
+      }
+    }
+    visiting.delete(pkg.name);
+    visited.add(pkg.name);
+    ordered.push(pkg);
+  }
+  await visit(root);
+  return ordered;
+}
+
+async function rewriteManifest(
+  path: string,
+  sha: string,
+  workspaces: Map<string, GraphPackage>,
+): Promise<Map<string, string>> {
   const manifest = JSON.parse(await readFile(path, "utf8")) as Manifest;
-  const configured = new Set(PACKAGES.map(({ name }) => name));
   const rewritten = new Map<string, string>();
   for (const section of DEPENDENCY_SECTIONS) {
     const dependencies = manifest[section];
-    if (!dependencies || typeof dependencies === "string") continue;
+    if (!dependencies) continue;
     for (const [name, value] of Object.entries(dependencies)) {
-      if (configured.has(name) && value.startsWith("workspace:")) {
-        const url = graphUrl(name, sha, manifest.name);
-        dependencies[name] = url;
-        rewritten.set(name, url);
-      }
+      if (!value.startsWith("workspace:")) continue;
+      if (!workspaces.has(name)) fail(`${manifest.name}: ${section}.${name} is not a workspace`);
+      const url = graphUrl(name, sha, manifest.name);
+      dependencies[name] = url;
+      rewritten.set(name, url);
     }
   }
   await writeFile(path, `${JSON.stringify(manifest, null, 2)}\n`);
@@ -87,12 +155,10 @@ function validateManifest(
   manifest: Manifest,
   rewritten: Map<string, string>,
 ): void {
-  const configured = new Set(PACKAGES.map(({ name }) => name));
   for (const section of DEPENDENCY_SECTIONS) {
     const dependencies = manifest[section];
-    if (!dependencies || typeof dependencies === "string") continue;
+    if (!dependencies) continue;
     for (const [name, value] of Object.entries(dependencies)) {
-      if (!configured.has(name)) continue;
       if (value.startsWith("workspace:")) {
         fail(`${pkg.name}: packed ${section}.${name} still uses ${value}`);
       }
@@ -134,38 +200,26 @@ if (initialStatus) fail(`Alchemy checkout is dirty:\n${initialStatus}`);
 const sha = run(["git", "rev-parse", "HEAD"], checkout);
 if (!/^[0-9a-f]{40}$/.test(sha)) fail(`Expected a full git SHA, got ${sha}`);
 
-for (const pkg of PACKAGES) {
-  const manifestPath = join(checkout, pkg.path, "package.json");
-  if (!(await Bun.file(manifestPath).exists())) {
-    fail(`${pkg.name}: package is missing at ${manifestPath}`);
-  }
-  const manifest = JSON.parse(await readFile(manifestPath, "utf8")) as Manifest;
-  if (manifest.name !== pkg.name) {
-    fail(`${pkg.path}: expected package ${pkg.name}, found ${manifest.name ?? "none"}`);
-  }
-}
+const workspaces = await workspaceIndex(checkout);
+const packages = await deriveGraph(checkout, workspaces);
+console.log("Derived runtime package graph:");
+for (const pkg of packages) console.log(`${pkg.name} (${pkg.path})`);
+if (packages.at(-1)?.name !== ROOT_PACKAGE.name) fail(`${ROOT_PACKAGE.name} must be last`);
 
 const token = (await readFile(resolve(".auth-token"), "utf8")).trim();
 if (!token) fail(".auth-token is empty; run bun run token first");
 
-for (const pkg of PACKAGES) {
+for (const pkg of packages) {
   run(["bun", "run", "build"], join(checkout, pkg.path));
 }
 
 const staging = await mkdtemp(join(tmpdir(), "alchemy-package-graph-"));
 await cp(join(checkout, "package.json"), join(staging, "package.json"));
 await cp(join(checkout, "bun.lock"), join(staging, "bun.lock"));
-const rootManifest = JSON.parse(await readFile(join(checkout, "package.json"), "utf8")) as {
-  workspaces: { packages: string[] };
-};
-for (const pattern of rootManifest.workspaces.packages) {
-  for await (const manifest of new Bun.Glob(`${pattern}/package.json`).scan({
-    cwd: checkout,
-    onlyFiles: true,
-  })) {
-    await mkdir(dirname(join(staging, manifest)), { recursive: true });
-    await cp(join(checkout, manifest), join(staging, manifest));
-  }
+for (const pkg of workspaces.values()) {
+  const manifest = join(pkg.path, "package.json");
+  await mkdir(dirname(join(staging, manifest)), { recursive: true });
+  await cp(join(checkout, manifest), join(staging, manifest));
 }
 for (const workspace of ["distilled", "cloudflare-tools"]) {
   await mkdir(join(staging, workspace), { recursive: true });
@@ -174,7 +228,7 @@ for (const workspace of ["distilled", "cloudflare-tools"]) {
 }
 
 const packed: PackedPackage[] = [];
-for (const pkg of PACKAGES) {
+for (const pkg of packages) {
   const source = join(checkout, pkg.path);
   const staged = join(staging, pkg.path);
   await mkdir(dirname(staged), { recursive: true });
@@ -182,7 +236,7 @@ for (const pkg of PACKAGES) {
     recursive: true,
     filter: (path) => basename(path) !== "node_modules" && !path.endsWith(".tgz"),
   });
-  const rewritten = await rewriteManifest(join(staged, "package.json"), sha);
+  const rewritten = await rewriteManifest(join(staged, "package.json"), sha, workspaces);
 
   const readme = resolve(source, "../../README.md");
   if (await Bun.file(readme).exists()) await cp(readme, join(staged, "README.md"));
